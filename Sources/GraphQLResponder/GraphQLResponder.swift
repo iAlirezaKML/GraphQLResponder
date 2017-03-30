@@ -1,13 +1,23 @@
-@_exported import HTTP
 import GraphQL
 import Graphiti
+import Vapor
+import HTTP
 
 public let noRootValue: Void = Void()
 
-extension MediaType {
-    public static var html: MediaType {
-        return MediaType(type: "text", subtype: "html", parameters: ["charset": "utf-8"])
-    }
+//extension MediaType {
+//    public static var html: MediaType {
+//        return MediaType(type: "text", subtype: "html", parameters: ["charset": "utf-8"])
+//    }
+//}
+@_exported import struct Foundation.URL
+@_exported import struct Foundation.URLQueryItem
+import struct Foundation.URLComponents
+
+extension URL {
+	public var queryItems: [URLQueryItem] {
+		return URLComponents(url: self, resolvingAgainstBaseURL: false)?.queryItems ?? []
+	}
 }
 
 public struct GraphQLResponder<Root, Context> : Responder {
@@ -15,7 +25,7 @@ public struct GraphQLResponder<Root, Context> : Responder {
     let graphiQL: Bool
     let rootValue: Root
     let context: Context?
-
+	
     public init(
         schema: Schema<Root, Context>,
         graphiQL: Bool = false,
@@ -33,35 +43,38 @@ public struct GraphQLResponder<Root, Context> : Responder {
         var variables: [String: GraphQL.Map]? = nil
         var operationName: String? = nil
         var raw: Bool? = nil
-
-        loop: for queryItem in request.url.queryItems {
-            switch queryItem.name {
-            case "query":
-                query = queryItem.value
-            case "variables":
-                // TODO: parse variables as JSON
-                break
-            case "operationName":
-                operationName = queryItem.value
-            case "raw":
-                raw = queryItem.value.flatMap({ Bool($0) })
-            default:
-                continue loop
-            }
-        }
+		
+		if let url = URL(string: request.uri.path) {
+			loop: for queryItem in url.queryItems {
+				switch queryItem.name {
+				case "query":
+					query = queryItem.value
+				case "variables":
+					// TODO: parse variables as JSON
+					break
+				case "operationName":
+					operationName = queryItem.value
+				case "raw":
+					raw = queryItem.value.flatMap({ Bool($0) })
+				default:
+					continue loop
+				}
+			}
+		}
 
         // Get data from ContentNegotiationMiddleware
 
         if query == nil {
-            query = request.content?["query"].string
+            query = request.data["query"]?.string
         }
 
         if variables == nil {
-            if let vars = request.content?["variables"].dictionary {
+			
+            if let vars = request.query?.nodeObject?["variables"]?.nodeObject {
                 var newVariables: [String: GraphQL.Map] = [:]
 
                 for (key, value) in vars {
-                    newVariables[key] = convert(map: value)
+                    newVariables[key] = convert(node: value)
                 }
 
                 variables = newVariables
@@ -69,20 +82,22 @@ public struct GraphQLResponder<Root, Context> : Responder {
         }
 
         if operationName == nil {
-            operationName = request.content?["operationName"].string
+            operationName = request.data["operationName"]?.string
         }
 
         if raw == nil {
-            raw = request.content?["raw"].bool
+            raw = request.data["raw"]?.bool
         }
 
         // TODO: Parse the body from Content-Type
 
-        let showGraphiql = graphiQL && !(raw ?? false) && request.accept.matches(other: .html)
+        let showGraphiql = graphiQL &&
+			!(raw ?? false) &&
+			request.accept.contains(where: { $0.mediaType == "text/html" })
 
         if !showGraphiql {
             guard let graphQLQuery = query else {
-                throw HTTPError.badRequest(body: "Must provide query string.")
+                throw Abort.custom(status: .badRequest, message: "Must provide query string.")
             }
 
             let result: GraphQL.Map
@@ -112,7 +127,7 @@ public struct GraphQLResponder<Root, Context> : Responder {
                 )
             }
 
-            return Response(content: convert(map: result))
+			return try JSON(node: convert(map: result)).makeResponse()
         } else {
             var result: GraphQL.Map? = nil
 
@@ -151,32 +166,35 @@ public struct GraphQLResponder<Root, Context> : Responder {
             )
 
             // TODO: Add an initializer that takes body and contentType to HTTP
-            var response = Response(body: html)
-            response.contentType = .html
-            return response
+            return Response(headers: [HeaderKey.contentType : "text/html"], body: html)
         }
     }
 }
 
-func convert(map: Axis.Map) -> GraphQL.Map {
-    switch map {
+func convert(node: Vapor.Node) -> GraphQL.Map {
+    switch node {
     case .null:
         return .null
     case .bool(let bool):
         return .bool(bool)
-    case .double(let double):
-        return .double(double)
-    case .int(let int):
-        return .int(int)
+	case .number(let number):
+		switch number {
+		case .double(let double):
+			return .double(double)
+		case .int(let int):
+			return .int(int)
+		case .uint(let uint):
+			return .int(Int(uint))
+		}
     case .string(let string):
         return .string(string)
     case .array(let array):
-        return .array(array.map({ convert(map: $0) }))
-    case .dictionary(let dictionary):
+        return .array(array.map({ convert(node: $0) }))
+    case .object(let dictionary):
         var dict: [String: GraphQL.Map] = [:]
 
         for (key, value) in dictionary {
-            dict[key] = convert(map: value)
+            dict[key] = convert(node: value)
         }
 
         return .dictionary(dict)
@@ -185,27 +203,27 @@ func convert(map: Axis.Map) -> GraphQL.Map {
     }
 }
 
-func convert(map: GraphQL.Map) -> Axis.Map {
+func convert(map: GraphQL.Map) -> Vapor.Node {
     switch map {
     case .null:
         return .null
     case .bool(let bool):
         return .bool(bool)
     case .double(let double):
-        return .double(double)
+        return .number(Vapor.Node.Number(double))
     case .int(let int):
-        return .int(int)
+        return .number(Vapor.Node.Number(int))
     case .string(let string):
         return .string(string)
     case .array(let array):
         return .array(array.map({ convert(map: $0) }))
     case .dictionary(let dictionary):
-        var dict: [String: Axis.Map] = [:]
+        var dict: [String: Vapor.Node] = [:]
         
         for (key, value) in dictionary {
             dict[key] = convert(map: value)
         }
         
-        return .dictionary(dict)
+        return .object(dict)
     }
 }
